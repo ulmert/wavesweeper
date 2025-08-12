@@ -1,0 +1,1009 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="author" content="Jacob Ulmert">
+<meta name="description" content="Wave Sweeper | A Wavetable Generator for the Behringer Wave">
+<meta name="keywords" content="wavetable, generator, behringer, wave, synth">
+<title>Wave Sweeper | A Wavetable Generator for the Behringer Wave</title>
+<style>
+*{font-family:Consolas,monospace;font-size:13px;}
+body{padding:20px;background-color:rgb(255,255,255);}
+select{margin:8px;}
+input{margin-right:8px;margin-left:8px;margin-bottom:8px;margin-top:8px;}
+span{margin-right:8px;}
+.hoverDiv{position:absolute;z-index:10;border:2px solid #000;opacity:0.1;border-radius:2px;background:#fff;display:none;}
+.flex-panel{display:flex;flex-direction:column;border-radius:4px;border-color:#000000;border-width:1px;border-style:solid;padding:8px;background-color:rgb(255,255,255);margin-right:8px;margin-top:8px;}
+.setting-container{display:flex;align-items:center;}
+.label-global{font-weight:bold;}
+.label-separator{margin-top:8px;margin-bottom:8px;}
+.panel-header{font-weight:bold;}
+.main-container{max-width:1280px;margin:0 auto;width:100%;box-sizing:border-box;}
+#waveCanvas{border-radius:4px;border-color:#000000;border-width:1px;border-style:solid;background-color:#003088}
+</style>
+</head>
+<body>
+<div class="main-container">
+<div id="waveformHoverHighlight" class="hoverDiv"></div>
+<div style="display:flex;flex-direction:row;justify-content:flex-end;align-items:center;margin-right:0px;" class="flex-panel">
+<div style="flex:2;display:flex;align-items:center;">
+<select id="algoSelect"></select>
+<span id="algoSelectValue"></span>
+</div>
+<div style="margin-right:16px;display:flex;align-items:center;flex:1;">
+<label for="bitDepthSlider">Bitdepth</label>
+<input type="range" id="bitDepthSlider" min="4" max="16" step="1" value="16">
+<span id="bitDepthValue">16</span>
+<label for="normalisationSelect" style="margin-left:16px;">Normalize</label>
+<select id="normalisationSelect"></select>
+<label for="shuffleEnabled" style="margin-left:16px;">Shuffle</label>
+<input type="checkbox" id="shuffleEnabled" checked>
+</div>
+</div>
+<div style="display:flex;">
+<div id="oscWaveTypeSelectors" class="flex-panel" style="flex:2;"></div>
+<div id="oscMorphToggles" class="flex-panel" style="flex:1;"><label></label><br></div>
+<div id="oscRatioSliders" class="flex-panel" style="flex:3;"><span id="oscRatioValues"></span></div>
+<div id="oscGainSliders" class="flex-panel" style="flex:3;"><span id="oscGainValues"></span></div>
+<div id="oscWidthSliders" class="flex-panel" style="flex:3;margin-right:0px;"><span id="oscWidthValues"></span></div>
+</div>
+<div style="display:flex;">
+<div style="flex:1;margin-right:0px;">
+<p id="status"></p>
+</div>
+<div style="flex:1;display:flex;align-items:center;justify-content:flex-end;">
+<label for="receiveBufferSelect" class="label-global" style="margin-right:8px;">Destination</label>
+<select id="receiveBufferSelect"></select>
+<button id="startBtn" disabled>Send to Behringer Wave</button>
+</div>
+</div>
+</div>
+<script>
+// waveform.js
+class Waveform {
+    constructor() {
+        this.samples = new Int16Array(128);
+    }
+
+    getSamples() {
+        return this.samples;
+    }
+
+    swapByteOrder(bytes) {
+        for (let i = 0; i < bytes.length; i += 2) {
+            const temp = bytes[i];
+            bytes[i] = bytes[i + 1];
+            bytes[i + 1] = temp;
+        }
+    }
+
+    getSysEx(waveNum, waveSlot, waveName) {
+        const message = [];
+
+        message.push(
+            0xF0, 0x00, 0x20, 0x32, 0x00, 0x01, 0x39, 0x00, 0x74, 0x5D, waveNum,
+            waveSlot, 0x00
+        );
+
+        let checksum = 0;
+       
+        for (let i = 0; i < 16; i++) {
+            let charCode = 32;
+            if (i < waveName.length) {
+                charCode = waveName.charAt(i).toUpperCase().charCodeAt(0) & 0x7F;
+            }
+            checksum += charCode;
+            message.push(charCode);
+        }
+        console.log(message);
+        
+        const waveBytes = new Uint8Array(this.samples.buffer);
+        this.swapByteOrder(waveBytes);
+        let index = 0;
+        const totalLength = waveBytes.length;
+
+        while (index < totalLength - 4) {
+            const block = waveBytes.slice(index, index + 7);
+            let upperBits = 0x00;
+            for (let i = 0; i < block.length; i++) {
+                if (block[i] & 0x80) upperBits |= (1 << (i));
+            }
+            checksum += upperBits;
+            message.push(upperBits & 0x7F);
+
+            for (let i = 0; i < block.length; i++) {
+                const v = block[i] & 0x7F;
+                checksum += v;
+                message.push(v);
+            }
+            index += 7;
+        }
+
+        const finalBlock = waveBytes.slice(index, index + 4);
+        let upperBits = 0x00;
+        for (let i = 0; i < finalBlock.length; i++) {
+            if (finalBlock[i] & 0x80) upperBits |= (1 << (i));
+        }
+
+        checksum += upperBits;
+        message.push(upperBits & 0x7F);
+
+        for (let i = 0; i < finalBlock.length; i++) {
+            const v = finalBlock[i] & 0x7F;
+            checksum += v;
+            message.push(v);
+        }
+
+        message.push(checksum & 0x7F);
+        message.push(0xF7);
+
+        return message;
+    }
+}
+
+// engine.js
+const WaveType = {
+    SINE: 0,
+    TRIANGLE: 1,
+    SAW: 2,
+    RAMP: 3,
+    SQUARE: 4,
+};
+
+const Normalisation = {
+    NONE: 0,
+    SLOT: 1,
+    FULL: 2
+};
+
+const N_OSCILLATORS = 4;
+const OSCILLATOR_OUT_IDX = 4;
+const N_ALGOS = 8;
+
+class Route {
+    constructor(inArr, outArr) {
+        this.in = inArr;
+        this.out = outArr;
+    }
+}
+
+const routing = [
+    new Route([0x00, 0x01, 0x02, 0x03], [0x04, 0x00, 0x01, 0x02]),
+    new Route([0x00, 0x01, 0x02, 0x03], [0x04, 0x00, 0x01, 0x01]),
+    new Route([0x00, 0x01, 0x02, 0x03], [0x04, 0x00, 0x01, 0x00]),
+    new Route([0x00, 0x01, 0x02, 0x03], [0x04, 0x00, 0x00, 0x02]),
+    new Route([0x00, 0x01, 0x02, 0x03], [0x04, 0x00, 0x04, 0x02]),
+    new Route([0x00, 0x03, 0x03, 0x03], [0x04, 0x04, 0x04, 0x03]),
+    new Route([0x00, 0x01, 0x02, 0x03], [0x04, 0x04, 0x04, 0x02]),
+    new Route([0x00, 0x01, 0x02, 0x03], [0x04, 0x04, 0x04, 0x04])
+];
+
+const defaultEngineConfig = {
+    algo: 4,
+    oscRatio: [1, 1, 5, 8],
+    oscGain: [[1, 1, 0, 1, 0.2],[0.5, 0, 0.4, 0.05, 1]],
+    oscWidth: [[1, 1, 2, 1],[1, 1, 0.5, 1]],
+    oscMorph: [true, true, true, true, true],
+    oscWaveType: [WaveType.SINE, WaveType.SINE, WaveType.SINE, WaveType.SINE],
+    normalisation: Normalisation.FULL,
+    bitDepth:16
+};
+
+class Engine {
+    constructor(samplesLength, config = defaultEngineConfig) {
+        this.oscOut = new Array(N_OSCILLATORS + 1).fill(0);
+        this.oscRatio = config.oscRatio;
+        this.oscMorph = config.oscMorph;
+        this.oscWaveType = config.oscWaveType;
+
+        this.oscGain = config.oscGain;
+        this.oscWidth = config.oscWidth
+
+        this.algo = config.algo;
+        this.normalise = config.normalisation;
+        this.bitReduction = 16 - config.bitDepth;
+
+        this.buffer = new Float32Array(samplesLength);
+    }
+
+    getBitDepth() {
+        return 16 - this.bitReduction;
+    }
+
+    setBitDepth(BitRate) {
+        this.bitReduction = 16 - BitRate;
+    }
+
+
+    fmodf(a, b) {
+       return a - Math.floor(a / b) * b;
+    }
+
+    setWave(samples, mix) {
+
+        let phase = 0;
+        let phaseIncrement = (2 * Math.PI) / samples.length;
+        for (let i = 0; i < samples.length; i++) {
+
+            this.oscOut.fill(0, 0, N_OSCILLATORS + 2);
+
+            let oscIdx = N_OSCILLATORS;
+            while (oscIdx) {
+                oscIdx--;
+
+                if (this.oscRatio[oscIdx] != 0) {
+                    let phaseMod = this.fmodf((phase * this.oscRatio[oscIdx]) + (this.oscOut[routing[this.algo].in[oscIdx]] * Math.PI * 2), Math.PI * 2);
+
+                    if (phaseMod < 0) {
+                        phaseMod = (2 * Math.PI) + phaseMod;
+                    } else if (phaseMod >= 2 * Math.PI) {
+                        phaseMod -= phaseMod - (2 * Math.PI);
+                    }
+
+                    let gain = this.oscGain[0][oscIdx];
+                    if (this.oscMorph[oscIdx]) {
+                        gain = gain * (1 - mix) + this.oscGain[1][oscIdx] * mix;
+                    }
+
+                    let width = this.oscWidth[0][oscIdx];
+                    if (this.oscMorph[oscIdx]) {
+                        width = width * (1 - mix) + this.oscWidth[1][oscIdx] * mix;
+                    }
+
+                    this.oscOut[routing[this.algo].out[oscIdx]] += this.getOscSample(phaseMod, this.oscWaveType[oscIdx], width) * gain;
+                }
+            }
+
+            this.buffer[i] = this.oscOut[OSCILLATOR_OUT_IDX]; 
+
+            phase += phaseIncrement;
+        }
+
+        let peakValue = 0;
+
+        let gain = this.oscGain[0][OSCILLATOR_OUT_IDX];
+        if (this.oscMorph[OSCILLATOR_OUT_IDX]) {
+            gain = gain * (1 - mix) + this.oscGain[1][OSCILLATOR_OUT_IDX] * mix;
+        }
+
+        for (let i = 0; i < samples.length; i++) {
+            this.buffer[i] *= gain;
+            if (this.buffer[i] > 1) {
+                this.buffer[i] = 1;
+            } else if (this.buffer[i] < -1) {
+                this.buffer[i] = -1;
+            }
+            if (Math.abs(this.buffer[i]) > peakValue) {
+                peakValue = Math.abs(this.buffer[i]);
+            }
+        }
+
+        let multiplyFactor = 0;
+        if (samples instanceof Int16Array) {
+            multiplyFactor = 32767;
+        }
+        if (this.normalise != Normalisation.SLOT || peakValue == 0) {
+            peakValue = 1;
+        }
+
+        for (let i = 0; i < samples.length; i++) {
+            samples[i] = Math.round(this.buffer[i] / peakValue * multiplyFactor);
+            if (this.bitReduction != 0) {
+                samples[i] = (samples[i] >> this.bitReduction) << this.bitReduction;
+
+            }
+        }
+    }
+
+    getOscSample(phase, waveType, width) {
+        let s = 0;
+        switch (waveType) {
+            case WaveType.SINE:
+                s = Math.sin(phase);
+                break;
+            case WaveType.TRIANGLE:
+                s = 2 * (Math.abs((-1 + 2 * phase / (2 * Math.PI))) - 0.5);
+                break;
+            case WaveType.SAW:
+                s = -1 * ((phase / Math.PI) - 1);
+                break;
+            case WaveType.RAMP:
+                s = ((phase / Math.PI) - 1);
+                break;
+            case WaveType.SQUARE:
+                s = phase < (Math.PI * width) ? 1 : -1;
+                break;
+        }
+        return s;
+    }
+
+    supportsOscWidth(oscIdx) {
+        return this.oscWaveType[oscIdx] == WaveType.SQUARE;
+    }
+
+    getOscOutput(oscIdx) {
+        return routing[this.algo].out[oscIdx];
+    }
+
+    getOscInput(oscIdx) {
+        return routing[this.algo].in[oscIdx];
+    }
+}
+
+// shuffle.js
+class Shuffle {
+    constructor() {
+        this.order = [];
+        this.enabled = false;
+    }
+
+    generate() {
+        this.order = [];
+        let nums = Array.from({ length: 64 }, (_, i) => i);
+        while (nums.length > 0) {
+            const idx = Math.floor(Math.random() * nums.length);
+            const picked = nums[idx];
+            nums.splice(idx, 1);
+            this.order.push(picked);
+        }
+    }
+}
+
+// Original index.js script
+let waveforms = Array.from({ length: 64 }, () => new Waveform());
+let engine = new Engine(waveforms[0].getSamples().length);
+let shuffle = new Shuffle();
+
+const waveformConfig = {
+    cols: 16,
+    rows: 4
+};
+
+const midiConnectivity = {
+    output: null,
+    input: null,
+    waveTransmitIdx: 0,
+    checksum: 0,
+    pendingMessages: null,
+    waitingForResponse: false
+};
+
+const audioPlayback = {
+    audioCtx: null,
+    sourceNode: null,
+    isPlaying: false,
+    currentWaveformIdx: null
+};
+
+let hoverDiv = null;
+let mouseDown = false;
+
+function drawWaveforms() {
+    const canvas = document.getElementById("waveCanvas");
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.lineWidth = 3; 
+    ctx.strokeStyle = "#fff";
+
+    const cellWidth = canvas.width / waveformConfig.cols;
+    const cellHeight = canvas.height / waveformConfig.rows;
+
+    for (let w = 0; w < waveforms.length; w++) {
+        const samples = waveforms[w].getSamples();
+        const col = w % waveformConfig.cols;
+        const row = Math.floor(w / waveformConfig.cols);
+        const xOffset = col * cellWidth;
+        const yOffset = row * cellHeight;
+
+        ctx.save();
+        ctx.translate(xOffset, yOffset);
+
+        ctx.beginPath();
+        for (let i = 0; i < samples.length; i++) {
+            const x = (i / (samples.length - 1)) * (cellWidth - 2);
+            const y = (cellHeight / 2) - (samples[i] / 32767) * ((cellHeight / 2 - 4));
+
+            if (i === 0) {
+                ctx.moveTo(x, y);
+            } else {
+                ctx.lineTo(x, y);
+            }
+        }
+        ctx.stroke();
+        ctx.restore();
+    }
+}
+
+function setOscillatorLabels() {
+    for (let i = 0; i < (N_OSCILLATORS + 1); i++) {
+        const labels = document.querySelectorAll(`.osc-${i}`);
+        labels.forEach(label => {
+            if (i == OSCILLATOR_OUT_IDX) {
+                label.textContent = "Out W ";
+            } else if (engine.getOscOutput(i) == OSCILLATOR_OUT_IDX) {
+                label.textContent = `Out ${i} `;
+            } else {
+                label.textContent = `Mod ${i} `;
+            }
+        }); 
+    }
+}
+
+function toggleMorphTargets() {
+    for (let i = 0; i < (N_OSCILLATORS + 1); i++) {
+        const sliders = document.querySelectorAll(`.morph-target-${i}`);
+        sliders.forEach(slider => {
+            if (slider.classList.contains(`width-support-${i}`) && !engine.supportsOscWidth(i)) {
+                slider.disabled = true;
+            } else {
+                slider.disabled = !engine.oscMorph[i];
+            }
+        });
+    }
+}
+
+function toggleWidthSupport() {
+    for (let i = 0; i < (N_OSCILLATORS + 1); i++) {
+        const sliders = document.querySelectorAll(`.width-support-${i}`);
+        sliders.forEach(slider => {
+            if (slider.classList.contains(`morph-target-${i}`) && !engine.oscMorph[i]) {
+                slider.disabled = true;
+            } else {
+                slider.disabled = !engine.supportsOscWidth(i);
+            }
+        });
+    }
+}
+
+function setAlgoDescription() {
+    let innerHTML = "";
+    for (let i = (N_OSCILLATORS - 1); i >= 0; i--) {
+        let inputIdx = engine.getOscInput(i);
+        let outputIdx = engine.getOscOutput(i);
+        if (inputIdx != outputIdx && inputIdx != i) {
+            innerHTML += `(${inputIdx} →) `;
+        }
+        if (outputIdx == OSCILLATOR_OUT_IDX) {
+            innerHTML += `${i} → W`;
+        } else {
+            innerHTML += `${i} → ${outputIdx}`;
+        }
+        if (i > 0) {
+            innerHTML += " | ";
+        }
+    }
+    document.getElementById("algoSelectValue").innerHTML = innerHTML;
+}
+
+
+function createAlgoDropdown() {
+    const select = document.getElementById("algoSelect");
+    select.innerHTML = "";
+    for (let i = 0; i < 8; i++) {
+        const option = Object.assign(document.createElement("option"), { value: i, textContent: `Algorithm ${i}` });
+        if (i === engine.algo) option.selected = true;
+        select.appendChild(option);
+    }
+    select.addEventListener("change", function() {
+        engine.algo = parseInt(this.value, 10);
+        setAlgoDescription();
+        setOscillatorLabels();
+        runEngine();
+    });
+}
+
+function createNormalisationDropdown() {
+    const select = document.getElementById("normalisationSelect");
+    select.innerHTML = "";
+    const normalisationKeys = Object.keys(Normalisation);
+    normalisationKeys.forEach(key => select.appendChild(Object.assign(document.createElement("option"), { value: Normalisation[key], textContent: key.charAt(0) + key.slice(1).toLowerCase(), selected: engine.normalise === Normalisation[key] })));
+
+    select.addEventListener("change", function() {
+        engine.normalise = parseInt(this.value, 10);
+        runEngine();
+    });
+}
+
+function createOscWidthSliders() {
+    const container = document.getElementById("oscWidthSliders");
+    const valuesSpan = document.getElementById("oscWidthValues");
+    valuesSpan.textContent = "";
+    container.innerHTML = "<label class='panel-header'>WIDTH</label><br>";
+
+    for (let widthIdx = 0; widthIdx < 2; widthIdx++) {
+        const div = document.createElement("div");
+    
+        container.appendChild(div);
+        
+        let isMorphTarget = false;
+        if (widthIdx > 0) {
+            div.appendChild(Object.assign(document.createElement("div"), { textContent: "Morph →", className: "label-separator" }));
+            isMorphTarget = true;
+        }
+
+        for (let i = 0; i < engine.oscWidth[widthIdx].length; i++) {
+            const slider = Object.assign(document.createElement("input"), {
+                type: "range", min: "0", max: "2",step: "0.01",
+                value: engine.oscWidth[widthIdx][i],
+                id: `oscWidthSlider${widthIdx}${i}`,
+                className: `width-support-${i}` + (isMorphTarget ? ` morph-target-${i}` : "")
+            });
+
+            slider.addEventListener("input", function() {
+                engine.oscWidth[widthIdx][i] = parseFloat(this.value);
+                document.getElementById(`oscWidthValue${widthIdx}${i}`).textContent = this.value;
+                runEngine();
+            });
+
+            const label = Object.assign(document.createElement("label"), { textContent: `Osc ${i}: `, className: `osc-${i}`, htmlFor: slider.id });
+            const valueSpan = Object.assign(document.createElement("span"), { id: `oscWidthValue${widthIdx}${i}`, textContent: slider.value });
+            const divSetting = Object.assign(document.createElement("div"), { className: "setting-container" });
+
+            divSetting.appendChild(label);
+            divSetting.appendChild(slider);
+            divSetting.appendChild(valueSpan);
+    
+            div.appendChild(divSetting);
+        }
+    }
+}
+
+function createOscWaveTypeSelectors() {
+    const container = document.getElementById("oscWaveTypeSelectors");
+    container.innerHTML = "<label class='panel-header'>SHAPE</label><br>";
+
+    const waveTypeKeys = Object.keys(WaveType);
+
+    for (let i = 0; i < engine.oscWaveType.length; i++) {
+        const select = Object.assign(document.createElement("select"), { id: `oscWaveTypeSelect${i}` });
+
+        waveTypeKeys.forEach(key => {
+            const option = document.createElement("option");
+            option.value = WaveType[key];
+            option.textContent = key.charAt(0) + key.slice(1).toLowerCase();
+            if (engine.oscWaveType[i] === WaveType[key]) option.selected = true;
+            select.appendChild(option);
+        });
+
+        select.addEventListener("change", function() {
+            engine.oscWaveType[i] = parseInt(this.value, 10);
+            toggleWidthSupport();
+            runEngine();
+        });
+
+        const label = Object.assign(document.createElement("label"), { className: `osc-${i}`, htmlFor: select.id });
+
+        const div = document.createElement("div");
+        div.appendChild(label);
+        div.appendChild(select);
+        container.appendChild(div);
+    }
+}
+
+function createOscMorphToggles() {
+    const container = document.getElementById("oscMorphToggles");
+
+    container.innerHTML = "<label class='panel-header'>MORPH</label><br>";
+    for (let i = 0; i < engine.oscMorph.length; i++) {
+        const checkbox = Object.assign(document.createElement("input"), { type: "checkbox", checked: engine.oscMorph[i], id: `oscMorphToggle${i}` });
+
+        checkbox.addEventListener("change", function() {
+            engine.oscMorph[i] = this.checked;
+            toggleMorphTargets();
+            runEngine();
+        });
+
+        const label = Object.assign(document.createElement("label"), { className: `osc-${i}`, htmlFor: checkbox.id });
+        const div = Object.assign(document.createElement("div"), { className: "setting-container" }); container.appendChild(div);
+        div.appendChild(label);
+        div.appendChild(checkbox);
+    }
+}
+
+function createOscRatioSliders() {
+    const container = document.getElementById("oscRatioSliders");
+    container.innerHTML = "<label class='panel-header'>RATIO</label><br>";
+
+    for (let i = 0; i < engine.oscRatio.length; i++) {
+        const slider = Object.assign(document.createElement("input"), { type: "range", min: "0", max: "16", step: "1", value: engine.oscRatio[i], id: `oscRatioSlider${i}` });
+
+        slider.addEventListener("input", function() {
+            engine.oscRatio[i] = parseInt(this.value, 10);
+            document.getElementById(`oscRatioValue${i}`).textContent = this.value;
+            runEngine();
+        });
+
+        const label = Object.assign(document.createElement("label"), { className: `osc-${i}`, htmlFor: slider.id });
+        const valueSpan = Object.assign(document.createElement("span"), { id: `oscRatioValue${i}`, textContent: slider.value });
+        const div = Object.assign(document.createElement("div"), { className: "setting-container" });
+
+        div.appendChild(label);
+        div.appendChild(slider);
+        div.appendChild(valueSpan);
+        div.appendChild(document.createElement("br"));
+
+        container.appendChild(div);
+    }
+}
+
+function createOscGainSliders() {
+    const container = document.getElementById("oscGainSliders");
+    container.innerHTML = "<label class='panel-header'>GAIN</label><br>";
+    
+    for (let gainIdx = 0; gainIdx < 2; gainIdx++) {
+
+        const div = document.createElement("div");
+        let isMorphTarget = false;
+        if (gainIdx > 0) {
+            div.appendChild(Object.assign(document.createElement("div"), { textContent: "Morph →", className: "label-separator" }));
+            isMorphTarget = true;
+        }
+
+        for (let i = 0; i < engine.oscGain[gainIdx].length; i++) {
+            const slider = Object.assign(document.createElement("input"), { type: "range", min: "0", max: "1", step: "0.01", value: engine.oscGain[gainIdx][i], id: `oscGainSlider${gainIdx}${i}`, className: isMorphTarget ? `morph-target-${i}` : "" });
+
+            slider.addEventListener("input", function() {
+                engine.oscGain[gainIdx][i] = parseFloat(this.value);
+                document.getElementById(`oscGainValue${gainIdx}${i}`).textContent = this.value;
+                runEngine();
+            });
+
+            const label = Object.assign(document.createElement("label"), { className: `osc-${i}`, htmlFor: slider.id });
+            const valueSpan = Object.assign(document.createElement("span"), { id: `oscGainValue${gainIdx}${i}`, textContent: slider.value });
+            const divSetting = Object.assign(document.createElement("div"), { className: "setting-container" });
+
+            divSetting.append(label, slider, valueSpan);
+
+            div.appendChild(divSetting);
+        }
+        container.appendChild(div);
+    }
+}
+
+function createReceiveBufferDropdown() {
+    const select = document.getElementById("receiveBufferSelect");
+    select.innerHTML = "";
+
+    const firstOption = document.createElement("option");
+    firstOption.value = "0";
+    firstOption.textContent = "Listen Buffer";
+    select.appendChild(firstOption);
+    
+    for (let i = 64; i <= 127; i++) {
+        const option = document.createElement("option");
+        option.value = i;
+        option.textContent = i;
+        select.appendChild(option);
+    }
+}
+
+function stopWaveform() {
+    if (audioPlayback.sourceNode) {
+        audioPlayback.sourceNode.stop();
+        audioPlayback.sourceNode.disconnect();
+        audioPlayback.sourceNode = null;
+    }
+    audioPlayback.isPlaying = false;
+    audioPlayback.currentWaveformIdx = null;
+}
+
+function playWaveform(waveformIdx) {
+    if (!audioPlayback.audioCtx) {
+        audioPlayback.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    }
+    stopWaveform();
+
+    const samples = waveforms[waveformIdx].getSamples();
+    const buffer = audioPlayback.audioCtx.createBuffer(1, samples.length, audioPlayback.audioCtx.sampleRate);
+    
+    const floatSamples = buffer.getChannelData(0);
+    for (let i = 0; i < samples.length; i++) {
+        floatSamples[i] = samples[i] / 32768;
+    }
+
+    audioPlayback.sourceNode = audioPlayback.audioCtx.createBufferSource();
+    audioPlayback.sourceNode.buffer = buffer;
+    audioPlayback.sourceNode.loop = true;
+    audioPlayback.sourceNode.connect(audioPlayback.audioCtx.destination);
+    audioPlayback.sourceNode.start();
+    audioPlayback.isPlaying = true;
+    audioPlayback.currentWaveformIdx = waveformIdx;
+}
+
+
+function positionHoverDiv(idx) {
+    const canvas = document.getElementById("waveCanvas");
+    if (!canvas) return;
+
+    const rect = canvas.getBoundingClientRect();
+
+    const cellWidth = rect.width / waveformConfig.cols;
+    const cellHeight = rect.height / waveformConfig.rows;
+    const col = idx % waveformConfig.cols;
+    const row = Math.floor(idx / waveformConfig.cols);
+
+    hoverDiv.style.left = (rect.left + window.scrollX + col * cellWidth) + "px";
+    hoverDiv.style.top = (rect.top + window.scrollY + row * cellHeight) + "px";
+    hoverDiv.style.width = cellWidth + "px";
+    hoverDiv.style.height = cellHeight + "px";
+    hoverDiv.style.display = "block";
+}
+
+function hideHoverDiv() {
+    hoverDiv.style.display = "none";
+}
+
+function runEngine() {
+
+    for (let w = 0; w < waveforms.length; w++) {
+        let i = w;
+        if (shuffle.enabled) {
+            i = shuffle.order[w];
+        }
+        engine.setWave(waveforms[i].getSamples(), (w / (waveforms.length - 1)));
+    }
+
+    if (engine.normalise == Normalisation.FULL) {
+        let peakValue = 0;
+        for (let w = 0; w < waveforms.length; w++) {
+            let samples = waveforms[w].getSamples();
+           
+            for (let i = 0; i < samples.length; i++) {
+                if (Math.abs(samples[i]) > peakValue) {
+                    peakValue = Math.abs(samples[i]);
+                }
+            }
+        }
+        if (peakValue != 0) {
+            let multiplyFactor = 0;
+            if (waveforms[0].getSamples() instanceof Int16Array) {
+                multiplyFactor = 32767;
+            }
+            multiplyFactor = multiplyFactor / peakValue;
+            for (let w = 0; w < waveforms.length; w++) {
+                let samples = waveforms[w].getSamples();
+                for (let i = 0; i < samples.length; i++) {
+                    samples[i] *= multiplyFactor;
+                }
+            }
+        }
+    }
+    drawWaveforms();
+}
+
+function transmit() {
+
+    document.getElementById("startBtn").disabled = true;
+
+    const select = document.getElementById("receiveBufferSelect");
+    const waveNum = select.value;
+    const waveNumByte = Number(waveNum) & 0x7F;
+
+    midiConnectivity.pendingMessages = [];
+    for (let i = 0; i < 64; i++) {
+        const msg = waveforms[i].getSysEx(waveNumByte, i, "WAVESWEEPER_" + waveNum);
+        midiConnectivity.pendingMessages.push(msg);
+    }
+    midiConnectivity.waveTransmitIdx = 0;
+    sendNextMessage();
+}
+
+function sendNextMessage() {
+    if (midiConnectivity.pendingMessages != null) {
+        if (midiConnectivity.waitingForResponse || midiConnectivity.waveTransmitIdx >= midiConnectivity.pendingMessages.length) {
+            if (midiConnectivity.waveTransmitIdx >= midiConnectivity.pendingMessages.length) {
+                document.getElementById("startBtn").disabled = false;
+
+                document.getElementById("status").textContent += "Done";
+                console.log("All messages sent.");
+                midiConnectivity.pendingMessages = null;
+            }
+            return;
+        }
+        const message = midiConnectivity.pendingMessages[midiConnectivity.waveTransmitIdx];
+        if (midiConnectivity.output) {
+            window.waveformTimeoutId = setTimeout(() => {
+                document.getElementById("startBtn").disabled = false;
+
+                document.getElementById("status").textContent += '.Timeout';
+                console.log(`Timeout while waiting for response to waveform ${midiConnectivity.waveTransmitIdx}`);
+                midiConnectivity.pendingMessages = null;
+                midiConnectivity.waitingForResponse = false;
+            }, 3000);
+
+            midiConnectivity.output.send(message);
+            console.log(`Sent waveform ${midiConnectivity.waveTransmitIdx}`);
+            midiConnectivity.waitingForResponse = true;
+        }
+    }
+}
+
+function onMIDIMessage(event) {
+    const hex = Array.from(event.data).map(b => b.toString(16).padStart(2, '0').toUpperCase()).join(' ');
+    
+    const line = `[${new Date().toLocaleTimeString()}] ${hex}`;
+    console.log("Received MIDI:", line);
+
+    if (midiConnectivity.waitingForResponse) {
+        midiConnectivity.waitingForResponse = false;
+
+        if (event.data[0] === 0xF0 &&
+            event.data[event.data.length - 1] === 0xF7 &&
+            event.data[8] === 0x74 &&
+            event.data[9] === 0x5E
+        ) {
+            if (event.data[12] === 1) {
+                document.getElementById("status").textContent += '.';
+            } else if (event.data[12] === 0) {
+                document.getElementById("status").textContent += '?';
+            }
+        }
+        midiConnectivity.waveTransmitIdx++;
+
+        if (window.waveformTimeoutId) {
+            clearTimeout(window.waveformTimeoutId);
+        }
+
+        setTimeout(() => {
+            sendNextMessage();
+        }, 150);
+    }
+}
+
+function matchPortName(port, keyword = "wave") {
+    return port.name.toLowerCase().includes(keyword);
+}
+
+function initMIDI() {
+    navigator.requestMIDIAccess({ sysex: true }).then(access => {
+        const outputs = Array.from(access.outputs.values());
+        const inputs = Array.from(access.inputs.values());
+
+        midiConnectivity.output = outputs.find(port => matchPortName(port));
+        midiConnectivity.input = inputs.find(port => matchPortName(port));
+
+        if (midiConnectivity.output) {
+            console.log("Using MIDI output:", midiConnectivity.output.name);
+        } else {
+            console.warn('No matching MIDI output with name including "wave" found.');
+        }
+
+        if (midiConnectivity.input) {
+            midiConnectivity.input.onmidimessage = onMIDIMessage;
+            console.log("Using MIDI input:", midiConnectivity.input.name);
+        }
+
+        const status = document.getElementById("status");
+
+        if (midiConnectivity.output) {
+            status.textContent = "Wave device found.";
+            document.getElementById("startBtn").disabled = false;
+        } else {
+            status.textContent = "No Wave device found.";
+        }
+    }).catch(err => {
+        console.error("MIDI initialization failed:", err);
+        document.getElementById("status").textContent = "MIDI init failed.";
+    });
+}
+
+function getWaveformIdx(canvas, e) {
+    const rect = canvas.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+
+    const cellWidth = rect.width / waveformConfig.cols;
+    const cellHeight = rect.height / waveformConfig.rows;
+    const col = Math.floor(x / cellWidth);
+    const row = Math.floor(y / cellHeight);
+    const idx = row * waveformConfig.cols + col;
+    return idx;
+}
+
+window.addEventListener("load", () => {
+    initMIDI();
+    
+    const canvasEl = document.createElement("canvas");
+    canvasEl.id = "waveCanvas";
+
+    canvasEl.style.display = "block";
+
+    canvasEl.style.width = "1278px";
+    canvasEl.style.height = "400px";
+
+    function resizeCanvas() {
+        const dpr = window.devicePixelRatio || 1;
+        canvasEl.width = window.innerWidth * dpr;
+        canvasEl.height = window.innerHeight * dpr;
+
+        if (typeof drawWaveforms === "function") drawWaveforms();
+
+        if (hoverDiv != null && hoverDiv.style.display === "block" && typeof audioPlayback.currentWaveformIdx === "number") {
+            positionHoverDiv(audioPlayback.currentWaveformIdx);
+        }
+    }
+    window.addEventListener("resize", resizeCanvas);
+
+    const mainContainer = document.querySelector('.main-container');
+    mainContainer.insertBefore(canvasEl, mainContainer.firstChild);
+
+    createOscGainSliders();
+    createOscWidthSliders();
+    createAlgoDropdown();
+    createOscRatioSliders();
+    createOscMorphToggles();
+    createOscWaveTypeSelectors();
+    createNormalisationDropdown();
+    createReceiveBufferDropdown();
+
+    document.getElementById("bitDepthSlider").value = engine.getBitDepth();
+    document.getElementById("bitDepthValue").textContent = engine.getBitDepth();
+    document.getElementById("shuffleEnabled").checked = shuffle.enabled ?? true;
+
+    setOscillatorLabels();
+    toggleMorphTargets();
+    toggleWidthSupport();
+    setAlgoDescription();
+
+    shuffle.generate();
+
+    resizeCanvas();
+    runEngine();
+
+    hoverDiv = document.getElementById("waveformHoverHighlight");
+    hoverDiv.style.display = "none";
+
+    const canvas = document.getElementById("waveCanvas");
+    if (canvas) {
+        canvas.addEventListener("mousedown", function(e) {
+            mouseDown = true;
+            const idx = getWaveformIdx(canvas, e);
+            if (idx >= 0 && idx < waveforms.length) {
+                playWaveform(idx);
+                positionHoverDiv(idx);
+            }
+        });
+
+        canvas.addEventListener("mousemove", function(e) {
+            if (!mouseDown) return;
+            const idx = getWaveformIdx(canvas, e);
+            if (idx >= 0 && idx < waveforms.length) {
+                positionHoverDiv(idx);
+                if (mouseDown && idx !== audioPlayback.currentWaveformIdx) {
+                    playWaveform(idx);
+                }
+            } else {
+                hideHoverDiv();
+            }
+        });
+
+        window.addEventListener("mouseup", function() {
+            mouseDown = false;
+            hideHoverDiv();
+            stopWaveform();
+        });
+    }
+
+    document.getElementById("startBtn").addEventListener("click", () => {
+        if (midiConnectivity.pendingMessages == null) {
+            document.getElementById("status").textContent = "Sending";
+        }
+        transmit();
+    });
+    
+    document.getElementById("bitDepthSlider").addEventListener("input", function() {
+        engine.setBitDepth(parseInt(this.value, 10));
+        document.getElementById("bitDepthValue").textContent = this.value;
+        runEngine();
+    });
+
+    document.getElementById("shuffleEnabled").addEventListener("change", function() {
+        shuffle.enabled = this.checked;
+        shuffle.generate();
+        runEngine();
+    });
+});
+</script>
+</body>
+</html>
