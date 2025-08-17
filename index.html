@@ -8,7 +8,7 @@
     <title>Wave Sweeper | A Wavetable Generator for the Behringer Wave</title>
     <style>
         * {
-            font-family: Consolas, monospace;
+            font-family: "Courier New", monospace;
             font-size: 12px;
         }
         body { padding: 20px; background-color: rgb(255, 255, 255);}
@@ -21,7 +21,7 @@
         .setting-container { display: flex; align-items: center; }
         .label-global { font-weight: bold; }
         .label-separator { margin-top:8px; margin-bottom:8px; }
-        .panel-header { font-weight: bold; }
+        .panel-header { font-weight: bold; margin-bottom:8px; }
         .main-container { max-width: 1280px; margin: 0 auto; width: 100%; box-sizing: border-box; }
         #waveCanvas { border-radius: 4px; border-color: #000000; border-width: 1px; background-color: #3872d6; }
     </style>
@@ -86,6 +86,7 @@
                 <label for="receiveBufferSelect" class="label-global" style="margin-right: 8px;">Destination</label>
                 <select id="receiveBufferSelect"></select>
                 <button id="sendButton" disabled>Send to Behringer Wave</button>
+                <button id="downloadButton" style="margin-left:8px;">Download</button>
             </div>
         </div>
     </div>
@@ -422,13 +423,7 @@ class EnvelopeEditor extends HTMLElement {
     const numDivisions = 4;
     for (let i = 1; i < numDivisions; i++) {
       const x = this.PADDING + (i / numDivisions) * this.geom.innerW;
-      const line = this._svgElem('line', {
-        x1: x,
-        y1: 0,
-        x2: x,
-        y2: this.geom.h,
-        stroke: '#ccc',
-      });
+      const line = this._svgElem('line', { x1: x, y1: 0, x2: x, y2: this.geom.h, stroke: '#ccc' });
       this.$grid.appendChild(line);
     }
   }
@@ -513,9 +508,9 @@ class EnvelopeEditor extends HTMLElement {
       }
     }
   }
-  _onPointerUp = (e) => {
+  _onPointerUp = () => {
     if (!this.dragging) return;
-    const { idx, pointerId, start, id } = this.dragging;
+    const { pointerId } = this.dragging;
     try { this.$svg.releasePointerCapture(pointerId); } catch {}
     this._removePointerListeners();
     this.dragging = null;
@@ -528,8 +523,7 @@ class EnvelopeEditor extends HTMLElement {
     this.$svg.removeEventListener('pointercancel', this._onPointerUp);
   }
 }
-</script>
-<script>
+
 customElements.define('envelope-editor', EnvelopeEditor);
 let waveforms = Array.from({ length: 64 }, () => new Waveform());
 let engine = new Engine(waveforms[0].getSamples().length);
@@ -634,6 +628,56 @@ function drawWaveforms() {
         }
     });
 }
+function buildWavefile(fileName) {
+    const numChannels = 1;
+    const sampleRate = 44100;
+    const samplesPerWaveform = waveforms[0].getSamples().length;
+    const totalSamples = waveforms.length * samplesPerWaveform;
+    const wavData = new Int16Array(totalSamples);
+    for (let w = 0; w < waveforms.length; w++) {
+        const samples = waveforms[w].getSamples();
+        wavData.set(samples, w * samplesPerWaveform);
+    }
+    function createWavHeader(dataLength, sampleRate, numChannels, bitsPerSample) {
+        const blockAlign = numChannels * bitsPerSample / 8;
+        const byteRate = sampleRate * blockAlign;
+        const buffer = new ArrayBuffer(44);
+        const view = new DataView(buffer);
+        view.setUint32(0, 0x52494646, false);
+        view.setUint32(4, 36 + dataLength, true);
+        view.setUint32(8, 0x57415645, false);
+        view.setUint32(12, 0x666d7420, false);
+        view.setUint32(16, 16, true);
+        view.setUint16(20, 1, true);
+        view.setUint16(22, numChannels, true);
+        view.setUint32(24, sampleRate, true);
+        view.setUint32(28, byteRate, true);
+        view.setUint16(32, blockAlign, true);
+        view.setUint16(34, bitsPerSample, true);
+        view.setUint32(36, 0x64617461, false);
+        view.setUint32(40, dataLength, true);
+        return buffer;
+    }
+    const bitsPerSample = 16;
+    const wavHeader = createWavHeader(wavData.length * 2, sampleRate, numChannels, bitsPerSample);
+    const wavBuffer = new Uint8Array(44 + wavData.length * 2);
+    wavBuffer.set(new Uint8Array(wavHeader), 0);
+    for (let i = 0; i < wavData.length; i++) {
+        wavBuffer[44 + i * 2] = wavData[i] & 0xFF;
+        wavBuffer[44 + i * 2 + 1] = (wavData[i] >> 8) & 0xFF;
+    }
+    const blob = new Blob([wavBuffer], { type: "audio/wav" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = fileName + ".wav";
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => {
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+    }, 100);
+}
 function setOscillatorLabels() {
     for (let i = 0; i < (N_OSCILLATORS + 1); i++) {
         const labels = document.querySelectorAll(`.osc-${i}`);
@@ -720,7 +764,7 @@ function createOscWidthSliders() {
     const container = document.getElementById("oscWidthSliders");
     const valuesSpan = document.getElementById("oscWidthValues");
     valuesSpan.textContent = "";
-    container.innerHTML = "<div class='panel-header'>WIDTH</div>";
+    container.innerHTML = "<div class='panel-header'>Width</div>";
     for (let widthIdx = 0; widthIdx < 2; widthIdx++) {
         const div = document.createElement("div");
         container.appendChild(div);
@@ -753,7 +797,7 @@ function createOscWidthSliders() {
 }
 function createOscWaveTypeSelectors() {
     const container = document.getElementById("oscWaveTypeSelectors");
-    container.innerHTML = "<div class='panel-header'>SHAPE</div>";
+    container.innerHTML = "<div class='panel-header'>Shape</div>";
     const waveTypeKeys = Object.keys(WaveType);
     for (let i = 0; i < engine.oscWaveType.length; i++) {
         const select = Object.assign(document.createElement("select"), { id: `oscWaveTypeSelect${i}` });
@@ -778,7 +822,7 @@ function createOscWaveTypeSelectors() {
 }
 function createOscMorphToggles() {
     const container = document.getElementById("oscMorphToggles");
-    container.innerHTML = "<div class='panel-header'>MORPH</div>";
+    container.innerHTML = "<div class='panel-header'>Morph</div>";
     for (let i = 0; i < engine.oscMorph.length; i++) {
         const checkbox = Object.assign(document.createElement("input"), { type: "checkbox", checked: engine.oscMorph[i], id: `oscMorphToggle${i}` });
         checkbox.addEventListener("change", function() {
@@ -794,9 +838,9 @@ function createOscMorphToggles() {
 }
 function createOscOffsetSliders() {
     const container = document.getElementById("oscOffsetSliders");
-    container.innerHTML = "<div class='panel-header'>OFFSET</div>";
+    container.innerHTML = "<div class='panel-header'>Offset</div>";
     for (let i = 0; i < engine.oscOffset.length; i++) {
-        const slider = Object.assign(document.createElement("input"), { type: "range", min: "0", max: "1", step: "0.1", value: engine.oscOffset[i], id: `oscOffsetSlider${i}` });
+        const slider = Object.assign(document.createElement("input"), { type: "range", min: "0", max: "1", step: "0.05", value: engine.oscOffset[i], id: `oscOffsetSlider${i}` });
         slider.addEventListener("input", function() {
             engine.oscOffset[i] = parseFloat(this.value);
             document.getElementById(`oscOffsetValue${i}`).textContent = this.value;
@@ -814,7 +858,7 @@ function createOscOffsetSliders() {
 }
 function createOscRatioSliders() {
     const container = document.getElementById("oscRatioSliders");
-    container.innerHTML = "<div class='panel-header'>RATIO</div>";
+    container.innerHTML = "<div class='panel-header'>Ratio</div>";
     for (let i = 0; i < engine.oscRatio.length; i++) {
         const slider = Object.assign(document.createElement("input"), { type: "range", min: "0", max: "16", step: "1", value: engine.oscRatio[i], id: `oscRatioSlider${i}` });
         slider.addEventListener("input", function() {
@@ -834,7 +878,7 @@ function createOscRatioSliders() {
 }
 function createOscGainSliders() {
     const container = document.getElementById("oscGainSliders");
-    container.innerHTML = "<div class='panel-header'>GAIN</div>";
+    container.innerHTML = "<div class='panel-header'>Gain</div>";
     for (let gainIdx = 0; gainIdx < 2; gainIdx++) {
         const div = document.createElement("div");
         let isMorphTarget = false;
@@ -1180,6 +1224,9 @@ window.addEventListener("load", () => {
             document.getElementById("status").textContent = "Sending";
         }
         transmit();
+    });
+    document.getElementById("downloadButton").addEventListener("click", () => {
+        buildWavefile("wavesweeper_" + document.getElementById("receiveBufferSelect").value);
     });
     document.getElementById("bitDepthSlider").addEventListener("input", function() {
         engine.setBitDepth(parseInt(this.value, 10));
